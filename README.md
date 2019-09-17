@@ -1,2 +1,2 @@
-# bee-archiver-go
-Tint library that work to bring you sweet result
+# bzz-go
+Tiny library that work like a bee to bring you sweet result
