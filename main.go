@@ -23,10 +23,11 @@ const BufferSize = 4096
 func main() {
 	fmt.Println("Bee Compress (Go)")
 
-	source := "/Users/solkin/Desktop/apps-list.json"
-	output := "/Users/solkin/Desktop/apps-list.bee"
-	createArchive(source, output)
-	extractArchive(output, source)
+	source1 := "/Users/solkin/Desktop/apps-list.json"
+	source2 := "/Users/solkin/Desktop/apps-list(2).json"
+	output := "/Users/solkin/Desktop/apps-list.bzz"
+	createArchive(source1, output)
+	extractArchive(output, source2)
 }
 
 func extractArchive(source string, output string) {
@@ -38,20 +39,29 @@ func extractArchive(source string, output string) {
 	if err != nil {
 		panic(err)
 	}
+	reader := NewReader(srcFile)
+	writer := NewWriter(outFile)
 
-	tree, err := readDictionary(srcFile)
+	tree, err := readDictionary(reader)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("tree: ", len(tree))
 
-	size, err := readFileSize(srcFile)
+	size, err := readFileSize(reader)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("size: ", size)
 
-	if err := decompress(tree, size, srcFile, outFile); err != nil {
+	if err := decompress(tree, size, reader, writer); err != nil {
+		panic(err)
+	}
+
+	err = srcFile.Close()
+	if err != nil {
+		panic(err)
+	}
+	err = outFile.Close()
+	if err != nil {
 		panic(err)
 	}
 }
@@ -73,19 +83,20 @@ func createArchive(source string, output string) {
 	if err != nil {
 		panic(err)
 	}
+	reader := NewReader(srcFile)
+	writer := NewWriter(outFile)
 
-	//err = writeDictionary2(dict, len(leafs), outFile)
-	err = writeDictionary(leafs, outFile)
+	err = writeDictionary(dict, len(leafs), writer)
 	if err != nil {
 		panic(err)
 	}
 
-	err = writeFileSize(srcFile, outFile)
+	err = writeFileSize(srcFile, writer)
 	if err != nil {
 		panic(err)
 	}
 
-	err = compress(dict, srcFile, outFile)
+	err = compress(dict, reader, writer)
 	if err != nil {
 		panic(err)
 	}
@@ -193,106 +204,147 @@ func flatTree(tree []*Leaf, leafs []*Leaf) [256][]bool {
 	return dict
 }
 
-func readDictionary(file *os.File) ([]*Leaf, error) {
+func readDictionary(reader Reader) (*Leaf, error) {
 	var header struct {
 		Version uint16
 		Count   uint32
 	}
 
-	if err := binary.Read(file, binary.BigEndian, &header); err != nil {
+	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
 		return nil, err
 	}
 
-	leafs := make([]*Leaf, header.Count)
-
-	var value uint8
-	var frequency uint32
-	for i := 0; i < int(header.Count); i++ {
-		if err := binary.Read(file, binary.BigEndian, &value); err != nil {
-			return nil, err
+	if header.Version == 1 {
+		leafs := make([]*Leaf, header.Count)
+		var value uint8
+		var frequency uint32
+		for i := 0; i < int(header.Count); i++ {
+			if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+				return nil, err
+			}
+			if err := binary.Read(reader, binary.BigEndian, &frequency); err != nil {
+				return nil, err
+			}
+			leafs[i] = &Leaf{
+				Value:     value,
+				Frequency: int(frequency),
+			}
 		}
-		if err := binary.Read(file, binary.BigEndian, &frequency); err != nil {
-			return nil, err
+		return buildTree(leafs)[0], nil
+	} else if header.Version == 2 {
+		var sizes [256]uint8
+		for i := 0; i < int(header.Count); i++ {
+			var value uint8
+			var size uint8
+			if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+				return nil, err
+			}
+			if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
+				return nil, err
+			}
+			sizes[value] = size
 		}
-		leafs[i] = &Leaf{
-			Value:     value,
-			Frequency: int(frequency),
+		root := &Leaf{}
+		parent := root
+		for i := 0; i < len(sizes); i++ {
+			if size := sizes[i]; size > 0 {
+				for c := 0; c < int(size); c++ {
+					bit, err := reader.ReadBool()
+					if err != nil {
+						return nil, err
+					}
+					if bit {
+						if parent.One == nil {
+							parent.One = &Leaf{}
+						}
+						parent = parent.One
+					} else {
+						if parent.Zero == nil {
+							parent.Zero = &Leaf{}
+						}
+						parent = parent.Zero
+					}
+				}
+				parent.Value = uint8(i)
+				parent = root
+			}
 		}
+		return root, nil
+	} else {
+		panic(fmt.Sprintf("Unsupported archive verision %d", header.Version))
 	}
-
-	tree := buildTree(leafs)
-
-	return tree, nil
 }
 
-func writeDictionary(leafs []*Leaf, file *os.File) error {
-	buf := new(bytes.Buffer)
+func writeDictionary(dict [256][]bool, count int, writer Writer) error {
+	body := new(bytes.Buffer)
+	bitOutput := NewWriter(body)
 
-	version := 1
-	count := len(leafs)
+	version := 2
 
-	header := []interface{}{
-		uint16(version),
-		uint32(count),
+	if err := binary.Write(writer, binary.BigEndian, uint16(version)); err != nil {
+		return err
+	}
+	if err := binary.Write(writer, binary.BigEndian, uint32(count)); err != nil {
+		return err
 	}
 
-	for _, v := range header {
-		err := binary.Write(buf, binary.BigEndian, v)
-		if err != nil {
+	for value, path := range dict {
+		size := len(path)
+		if size == 0 {
+			continue
+		}
+		if err := binary.Write(writer, binary.BigEndian, uint8(value)); err != nil {
 			return err
+		}
+		if err := binary.Write(writer, binary.BigEndian, uint8(size)); err != nil {
+			return err
+		}
+		for i := size - 1; i >= 0; i-- {
+			if err := bitOutput.WriteBool(path[i]); err != nil {
+				return err
+			}
 		}
 	}
-	for _, leaf := range leafs {
-		if err := binary.Write(buf, binary.BigEndian, leaf.Value); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, uint32(leaf.Frequency)); err != nil {
-			return err
-		}
+	if err := bitOutput.Close(); err != nil {
+		return err
 	}
-	if _, err := file.Write(buf.Bytes()); err != nil {
+	if _, err := writer.Write(body.Bytes()); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func readFileSize(file *os.File) (uint64, error) {
+func readFileSize(file Reader) (uint64, error) {
 	var size uint64
 	if err := binary.Read(file, binary.BigEndian, &size); err != nil {
 		return 0, err
 	}
+	fmt.Println("size: ", size)
 	return size, nil
 }
 
-func writeFileSize(srcFile *os.File, outFile *os.File) error {
+func writeFileSize(srcFile *os.File, writer Writer) error {
 	stat, err := srcFile.Stat()
 	if err != nil {
 		return err
 	}
-
-	buf := new(bytes.Buffer)
-
-	if err = binary.Write(buf, binary.BigEndian, uint64(stat.Size())); err != nil {
+	size := uint64(stat.Size())
+	if err = binary.Write(writer, binary.BigEndian, size); err != nil {
 		return err
 	}
-
-	if _, err = outFile.Write(buf.Bytes()); err != nil {
-		return err
-	}
-
+	fmt.Println("size: ", size)
 	return nil
 }
 
-func decompress(tree []*Leaf, size uint64, source *os.File, output *os.File) error {
+func decompress(tree *Leaf, size uint64, reader Reader, writer Writer) error {
 	start := time.Now().UnixNano()
 
 	var written uint64
-	root := tree[0]
+	root := tree
 	var leaf = root
-	bitInput := NewReader(source)
 	for {
-		b, err := bitInput.ReadBool()
+		b, err := reader.ReadBool()
 		if err != nil {
 			panic(err)
 		}
@@ -305,7 +357,7 @@ func decompress(tree []*Leaf, size uint64, source *os.File, output *os.File) err
 		if child.Zero != nil || child.One != nil {
 			leaf = child
 		} else {
-			if err := binary.Write(output, binary.BigEndian, child.Value); err != nil {
+			if err := binary.Write(writer, binary.BigEndian, child.Value); err != nil {
 				return err
 			}
 			leaf = root
@@ -319,13 +371,12 @@ func decompress(tree []*Leaf, size uint64, source *os.File, output *os.File) err
 	return nil
 }
 
-func compress(dict [256][]bool, source *os.File, output *os.File) error {
+func compress(dict [256][]bool, reader Reader, writer Writer) error {
 	start := time.Now().UnixNano()
 
-	bitOutput := NewWriter(output)
 	buf := make([]byte, BufferSize)
 	for {
-		n, err := source.Read(buf)
+		n, err := reader.Read(buf)
 		if err != nil {
 			break
 		}
@@ -333,16 +384,16 @@ func compress(dict [256][]bool, source *os.File, output *os.File) error {
 			value := buf[i]
 			path := dict[value]
 			for j := len(path) - 1; j >= 0; j-- {
-				if err := bitOutput.WriteBool(path[j]); err != nil {
+				if err := writer.WriteBool(path[j]); err != nil {
 					panic(err)
 				}
 			}
 		}
 	}
-	if _, err := bitOutput.Align(); err != nil {
+	if _, err := writer.Align(); err != nil {
 		panic(err)
 	}
-	if err := bitOutput.Close(); err != nil {
+	if err := writer.Close(); err != nil {
 		panic(err)
 	}
 
