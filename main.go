@@ -269,6 +269,7 @@ func readDictionary(reader Reader) (*Leaf, error) {
 				parent = root
 			}
 		}
+		reader.Align()
 		return root, nil
 	} else {
 		panic(fmt.Sprintf("Unsupported archive verision %d", header.Version))
@@ -315,9 +316,9 @@ func writeDictionary(dict [256][]bool, count int, writer Writer) error {
 	return nil
 }
 
-func readFileSize(file Reader) (uint64, error) {
+func readFileSize(reader Reader) (uint64, error) {
 	var size uint64
-	if err := binary.Read(file, binary.BigEndian, &size); err != nil {
+	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
 		return 0, err
 	}
 	fmt.Println("size: ", size)
@@ -365,6 +366,9 @@ func decompress(tree *Leaf, size uint64, reader Reader, writer Writer) error {
 				break
 			}
 		}
+	}
+	if _, err := writer.Align(); err != nil {
+		return err
 	}
 
 	fmt.Printf("decompress time: %d msec\n", (time.Now().UnixNano()-start)/1000000)
